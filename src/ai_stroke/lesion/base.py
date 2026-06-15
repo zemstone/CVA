@@ -1,73 +1,99 @@
-"""Abstract interface for all 'stroke' (lesion) strategies.
+"""Base class for reversible lesion strategies.
 
-Design rule: a lesion strategy NEVER retrains. It only damages weights and is
-fully reversible via a context manager, so experiment 1 measures the pure
-effect of damage with no recovery contamination.
+A lesion zeroes out a fraction of a layer's output units (Conv2d output
+channels or Linear output features), then restores the original weights on
+exit -- guaranteeing no cross-contamination between experimental runs.
+
+Subclasses customize ONLY *which* channels to remove via ``select_channels``.
+All weight backup / zero-out / restore plumbing lives here.
 """
 from __future__ import annotations
 
-import contextlib
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Dict, Iterator
+from contextlib import contextmanager
+from typing import Iterator
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 
-@dataclass
-class LesionResult:
-    """Bookkeeping for an applied lesion (for logging / reproducibility)."""
+def _get_module(model: nn.Module, name: str) -> nn.Module:
+    """Resolve a dotted module path (e.g. 'features.0') to the module object."""
+    module = model
+    for part in name.split("."):
+        module = getattr(module, part)
+    return module
 
-    target_layer: str
-    damage_ratio: float
-    num_units_total: int
-    num_units_killed: int
-    seed: int
-    extra: Dict[str, float] = field(default_factory=dict)
+
+def _num_output_units(module: nn.Module) -> int:
+    """Number of output channels (Conv2d) or output features (Linear)."""
+    if isinstance(module, nn.Conv2d):
+        return module.out_channels
+    if isinstance(module, nn.Linear):
+        return module.out_features
+    raise TypeError(f"Unsupported layer type for lesion: {type(module).__name__}")
 
 
 class LesionStrategy(ABC):
-    """Base class for a reversible weight-damage strategy.
+    """Reversible lesion applied to one layer's output units."""
 
-    Subclasses implement ``_apply`` (zero-out selected units) and must store
-    enough state to restore the original weights afterwards.
-    """
-
-    def __init__(self) -> None:
-        self._backup: Dict[str, torch.Tensor] = {}
+    name: str = "base"
 
     @abstractmethod
-    def _apply(
-        self, model: nn.Module, target_layer: str, damage_ratio: float, seed: int
-    ) -> LesionResult:
-        """Damage ``target_layer`` in-place and return metadata."""
+    def select_channels(
+        self, module: nn.Module, n_kill: int, seed: int
+    ) -> np.ndarray:
+        """Return indices of output units to zero out.
 
-    def _backup_layer(self, layer: nn.Module, key: str) -> None:
-        """Clone original weights so the lesion can be undone."""
-        self._backup[key] = layer.weight.detach().clone()
+        Args:
+            module: The target Conv2d/Linear module.
+            n_kill: Number of output units to ablate.
+            seed: RNG seed for reproducibility.
 
-    def _restore(self, model: nn.Module) -> None:
-        """Restore all backed-up weights (heal the brain)."""
-        modules = dict(model.named_modules())
-        for key, weight in self._backup.items():
-            with torch.no_grad():
-                modules[key].weight.copy_(weight)
-        self._backup.clear()
-
-    @contextlib.contextmanager
-    def lesion(
-        self, model: nn.Module, target_layer: str, damage_ratio: float, seed: int
-    ) -> Iterator[LesionResult]:
-        """Context manager: apply lesion, yield metadata, then auto-restore.
-
-        Example:
-            with strategy.lesion(model, "features.0", 0.3, seed=0) as info:
-                acc = evaluate(model)   # measured WITH damage
-            # weights are automatically healed here
+        Returns:
+            1-D array of int indices into the output dimension, length ``n_kill``.
         """
-        result = self._apply(model, target_layer, damage_ratio, seed)
+        raise NotImplementedError
+
+    @contextmanager
+    def lesion(
+        self,
+        model: nn.Module,
+        layer_name: str,
+        ratio: float,
+        seed: int = 0,
+    ) -> Iterator[None]:
+        """Temporarily ablate ``ratio`` of a layer's output units.
+
+        Backs up weights (and bias), zeroes the selected output units, yields,
+        then restores the original parameters -- even if an exception occurs.
+        ``ratio == 0`` is a valid no-op (still safely backed up/restored).
+        """
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"ratio must be in [0, 1], got {ratio}.")
+
+        module = _get_module(model, layer_name)
+        n_units = _num_output_units(module)
+        n_kill = int(round(ratio * n_units))
+
+        # Backup on CPU clones so we always restore exactly.
+        weight_backup = module.weight.detach().clone()
+        bias_backup = (
+            module.bias.detach().clone() if module.bias is not None else None
+        )
+
         try:
-            yield result
+            if n_kill > 0:
+                idx = self.select_channels(module, n_kill, seed)
+                with torch.no_grad():
+                    module.weight[idx] = 0.0
+                    if module.bias is not None:
+                        module.bias[idx] = 0.0
+            yield
         finally:
-            self._restore(model)
+            # Always heal -- guarantees a clean baseline for the next run.
+            with torch.no_grad():
+                module.weight.copy_(weight_backup)
+                if bias_backup is not None:
+                    module.bias.copy_(bias_backup)
