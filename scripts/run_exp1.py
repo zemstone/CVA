@@ -13,6 +13,7 @@ import torch
 from ai_stroke.data.datamodule import get_dataloaders
 from ai_stroke.experiments.exp1_layer_sensitivity import Exp1Config, run_layer_sensitivity
 from ai_stroke.models.registry import MODEL_REGISTRY
+from ai_stroke.models.inspect import pick_layers_by_depth, resolve_layer_name
 from ai_stroke.utils.logging import get_logger
 from ai_stroke.utils.seed import set_seed
 from ai_stroke.viz.heatmap import plot_criticality_heatmap
@@ -45,18 +46,18 @@ def main() -> None:
     # 2) Data (test split only is needed for evaluation).
     _, test_loader = get_dataloaders(args.data_dir)
 
-    # 3) Define the sweep. Layers span early -> mid -> late (V1 -> IT -> PFC).
+    # 3) Auto-pick early/mid/late Conv layers + the first FC, by semantic depth.
+    #    No fragile integer indices: names are resolved from the real model.
+    conv_targets = pick_layers_by_depth(model, fractions=(0.0, 0.33, 0.66, 1.0))
+    fc_target = resolve_layer_name(model, "linear", 0)  # first FC (decision/PFC)
+
     cfg = Exp1Config(
-        target_layers=[
-            "features.0",    # early conv  (edges / V1)
-            "features.14",   # mid conv    (textures / V4)
-            "features.34",   # late conv   (objects / IT)
-            "classifier.0",  # first FC    (decision / PFC)
-        ],
+        target_layers=conv_targets + [fc_target],
         damage_ratios=[0.3, 0.5, 0.7],
         n_repeats=10,
         lesion_name="random_node_ablation",
     )
+    logger.info("Resolved target layers: %s", cfg.target_layers)
 
     # 4) Run and persist results.
     df = run_layer_sensitivity(model, test_loader, device, cfg)
